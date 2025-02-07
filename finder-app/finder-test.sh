@@ -60,6 +60,9 @@ done
 
 OUTPUTSTRING=$("${APPDIR}"/finder.sh "$WRITEDIR" "$WRITESTR")
 
+# write the output to a file
+echo "${OUTPUTSTRING}" > /tmp/assignment4-result.txt
+
 # remove temporary directories
 rm -rf /tmp/aeld-data
 
