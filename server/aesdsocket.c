@@ -58,7 +58,11 @@ static void start_daemon() {
   }
 
   umask(0);
-  chdir("/");
+
+  if (chdir("/") < 0) {
+    perror("chdir");
+    exit(EXIT_FAILURE);
+  }
 
   close(STDIN_FILENO);
   close(STDOUT_FILENO);
