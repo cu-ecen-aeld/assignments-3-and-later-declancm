@@ -3,19 +3,37 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/queue.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <syslog.h>
 #include <unistd.h>
 
+struct connection_data {
+  pthread_t pid;
+  int sockfd;
+  char ip_address[INET6_ADDRSTRLEN];
+  bool completed;
+  SLIST_ENTRY(connection_data) entries;
+};
+
+SLIST_HEAD(slisthead, connection_data);
+
+const char port[] = "9000";
+const char data_file_name[] = "/var/tmp/aesdsocketdata";
+
 bool caught_sigint = false;
 bool caught_sigterm = false;
+
+pthread_mutex_t data_file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void signal_handler(int signal_number) {
   if (signal_number == SIGINT) {
@@ -69,16 +87,116 @@ static void start_daemon() {
   close(STDERR_FILENO);
 }
 
-int main(int argc, char *argv[]) {
-  const char port[] = "9000";
-  const char data_file_name[] = "/var/tmp/aesdsocketdata";
-  char ip_address[INET6_ADDRSTRLEN];
+static void write_to_data_file(const char *line) {
+  pthread_mutex_lock(&data_file_mutex);
 
+  FILE *data_file = fopen(data_file_name, "a");
+
+  if (data_file == NULL) {
+    perror("fopen");
+  } else {
+    fprintf(data_file, "%s\n", line);
+    fclose(data_file);
+  }
+
+  pthread_mutex_unlock(&data_file_mutex);
+}
+
+static void send_data_file(int sockfd) {
+  pthread_mutex_lock(&data_file_mutex);
+
+  int fd = open(data_file_name, O_RDONLY);
+
+  if (fd < 0) {
+    perror("fopen");
+  } else {
+    struct stat file_stat;
+    fstat(fd, &file_stat);
+    sendfile(sockfd, fd, NULL, file_stat.st_size);
+  }
+
+  pthread_mutex_unlock(&data_file_mutex);
+}
+
+static void send_and_receive(struct connection_data *data) {
+  char buffer[1024];
+  ssize_t bytes_read = 0;
+
+  char *accum = NULL;
+  size_t accum_size = 0;
+  size_t accum_used = 0;
+
+  syslog(LOG_INFO, "Accepted connection from %s", data->ip_address);
+
+  while (1) {
+    bytes_read = recv(data->sockfd, buffer, sizeof(buffer), 0);
+    if (bytes_read == -1) {
+      perror("recv");
+      break;
+    }
+    if (bytes_read == 0) {
+      break;
+    }
+
+    size_t line_end = 0;
+    size_t line_start = 0;
+
+    while (line_end < bytes_read) {
+      bool newline_found = false;
+
+      while (++line_end < bytes_read) {
+        if (buffer[line_end] == '\n') {
+          newline_found = true;
+          break;
+        }
+      }
+
+      size_t line_size = line_end - line_start;
+      size_t accum_increase = line_size + 1;
+
+      // Check if the accumulator is large enough
+      if (accum_used + accum_increase >= accum_size) {
+        accum_size = accum_used + accum_increase;
+        char *new_accum = realloc(accum, accum_size);
+        if (new_accum == NULL) {
+          perror("realloc");
+          break;
+        }
+        accum = new_accum;
+      }
+
+      // Store the buffer in the accumulator
+      memcpy(accum + accum_used, buffer + line_start, line_size);
+      accum_used += line_size;
+
+      if (newline_found) {
+        accum[accum_used] = '\0';
+
+        write_to_data_file(accum);
+        send_data_file(data->sockfd);
+
+        // Reset the accumulator
+        line_start = line_end + 1;
+        accum_used = 0;
+      }
+    }
+  }
+
+  free(accum);
+  close(data->sockfd);
+
+  syslog(LOG_INFO, "Closed connection from %s", data->ip_address);
+
+  data->completed = true;
+}
+
+int main(int argc, char *argv[]) {
   int sockfd;
   int status;
   struct addrinfo hints;
   struct addrinfo *servinfo;
   struct addrinfo *rp;
+  struct connection_data *data;
 
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_UNSPEC;
@@ -104,18 +222,6 @@ int main(int argc, char *argv[]) {
     close(sockfd);
   }
 
-  if (rp != NULL) {
-    if (rp->ai_family == AF_INET) {
-      struct sockaddr_in *ipv4 = (struct sockaddr_in *)rp->ai_addr;
-      inet_ntop(rp->ai_family, &(ipv4->sin_addr), ip_address,
-                sizeof(ip_address));
-    } else if (rp->ai_family == AF_INET6) {
-      struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)rp->ai_addr;
-      inet_ntop(rp->ai_family, &(ipv6->sin6_addr), ip_address,
-                sizeof(ip_address));
-    }
-  }
-
   freeaddrinfo(servinfo);
 
   if (rp == NULL) {
@@ -137,13 +243,16 @@ int main(int argc, char *argv[]) {
 
   register_signal_handler();
 
+  struct slisthead head;
+  SLIST_INIT(&head);
+
   while (!caught_sigint && !caught_sigterm) {
-    int acceptedfd;
+    int clientfd;
     struct sockaddr_storage client_addr;
     socklen_t addr_size = sizeof(client_addr);
 
-    acceptedfd = accept(sockfd, (struct sockaddr *)&client_addr, &addr_size);
-    if (acceptedfd == -1) {
+    clientfd = accept(sockfd, (struct sockaddr *)&client_addr, &addr_size);
+    if (clientfd == -1) {
       if (errno == EINTR) {
         continue;
       }
@@ -151,90 +260,54 @@ int main(int argc, char *argv[]) {
       return -1;
     }
 
-    syslog(LOG_INFO, "Accepted connection from %s", ip_address);
+    data = malloc(sizeof(struct connection_data));
 
-    char buffer[1024];
-    ssize_t bytes_read = 0;
-
-    size_t accum_size = 0;
-    size_t accum_used = 0;
-    char *accum = NULL;
-
-    while (1) {
-      bytes_read = recv(acceptedfd, buffer, sizeof(buffer), 0);
-      if (bytes_read == -1) {
-        perror("recv");
-        return -1;
-      }
-      if (bytes_read == 0) {
-        break;
-      }
-
-      size_t line_end = 0;
-      size_t line_start = 0;
-
-      while (line_end < bytes_read) {
-        bool newline_found = false;
-
-        while (++line_end < bytes_read) {
-          if (buffer[line_end] == '\n') {
-            newline_found = true;
-            break;
-          }
-        }
-
-        size_t line_size = line_end - line_start;
-        size_t accum_increase = line_size + 1;
-
-        // Check if the accumulator is large enough
-        if (accum_used + accum_increase >= accum_size) {
-          accum_size = accum_used + accum_increase;
-          char *new_accum = realloc(accum, accum_size);
-          if (new_accum == NULL) {
-            perror("realloc");
-            return -1;
-          }
-          accum = new_accum;
-        }
-
-        // Store the buffer in the accumulator
-        memcpy(accum + accum_used, buffer + line_start, line_size);
-        accum_used += line_size;
-
-        // Check if the line is complete
-        if (newline_found) {
-          // Write the line to the data file
-          FILE *data_file = fopen(data_file_name, "a");
-          fwrite(accum, 1, accum_used, data_file);
-          fputc('\n', data_file);
-          fclose(data_file);
-
-          // Reset the accumulator
-          line_start = line_end + 1;
-          accum_used = 0;
-
-          // Send contents of the data file back to the client
-          data_file = fopen(data_file_name, "r");
-          while (1) {
-            size_t bytes_read = fread(buffer, 1, sizeof(buffer), data_file);
-            if (bytes_read == 0) {
-              break;
-            }
-            if (send(acceptedfd, buffer, bytes_read, 0) == -1) {
-              perror("send");
-              return -1;
-            }
-          }
-          fclose(data_file);
-        }
-      }
+    if (data == NULL) {
+      perror("malloc");
+      continue;
     }
 
-    free(accum);
-    close(acceptedfd);
+    if (client_addr.ss_family == AF_INET) {
+      struct sockaddr_in *ipv4 = (struct sockaddr_in *)&client_addr;
+      inet_ntop(AF_INET, &(ipv4->sin_addr), data->ip_address, INET_ADDRSTRLEN);
+    } else {
+      struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)&client_addr;
+      inet_ntop(AF_INET6, &(ipv6->sin6_addr), data->ip_address,
+                INET6_ADDRSTRLEN);
+    }
 
-    syslog(LOG_INFO, "Closed connection from %s", ip_address);
+    data->sockfd = clientfd;
+    data->completed = false;
+    pthread_create(&data->pid, NULL, (void *)&send_and_receive, data);
+
+    if (data->pid == -1) {
+      perror("pthread_create");
+      free(data);
+      continue;
+    }
+
+    SLIST_INSERT_HEAD(&head, data, entries);
+
+    struct connection_data *next;
+    data = SLIST_FIRST(&head);
+    while (data != NULL) {
+      next = SLIST_NEXT(data, entries);
+      if (data->completed) {
+        SLIST_REMOVE(&head, data, connection_data, entries);
+        pthread_join(data->pid, NULL);
+        free(data);
+      }
+      data = next;
+    }
   }
+
+  while (!SLIST_EMPTY(&head)) {
+    data = SLIST_FIRST(&head);
+    SLIST_REMOVE_HEAD(&head, entries);
+    pthread_join(data->pid, NULL);
+    free(data);
+  }
+  SLIST_INIT(&head);
 
   syslog(LOG_INFO, "Caught signal, exiting");
 
