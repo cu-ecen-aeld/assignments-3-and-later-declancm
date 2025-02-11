@@ -13,6 +13,7 @@
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -30,17 +31,18 @@ SLIST_HEAD(slisthead, connection_data);
 const char port[] = "9000";
 const char data_file_name[] = "/var/tmp/aesdsocketdata";
 
+bool caught_alarm = false;
 bool caught_sigint = false;
 bool caught_sigterm = false;
 
 pthread_mutex_t data_file_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void signal_handler(int signal_number) {
-  if (signal_number == SIGINT) {
-    printf("Caught SIGINT\n");
+  if (signal_number == SIGALRM) {
+    caught_alarm = true;
+  } else if (signal_number == SIGINT) {
     caught_sigint = true;
   } else if (signal_number == SIGTERM) {
-    printf("Caught SIGTERM\n");
     caught_sigterm = true;
   }
 }
@@ -49,6 +51,11 @@ static void register_signal_handler() {
   struct sigaction new_action;
   memset(&new_action, 0, sizeof(new_action));
   new_action.sa_handler = signal_handler;
+
+
+  if (sigaction(SIGALRM, &new_action, NULL) == -1) {
+    perror("sigaction");
+  }
 
   if (sigaction(SIGINT, &new_action, NULL) == -1) {
     perror("sigaction");
@@ -116,6 +123,30 @@ static void send_data_file(int sockfd) {
   }
 
   pthread_mutex_unlock(&data_file_mutex);
+}
+
+static void start_timer() {
+  const long interval = 10;
+
+  struct itimerval timer;
+  timer.it_value.tv_sec = interval;
+  timer.it_value.tv_usec = 0;
+  timer.it_interval.tv_sec = interval;
+  timer.it_interval.tv_usec = 0;
+
+  setitimer(ITIMER_REAL, &timer, NULL);
+}
+
+static void write_time_to_data() {
+  time_t time_raw;
+  struct tm time_info;
+  char time_string[80];
+
+  time(&time_raw);
+  localtime_r(&time_raw, &time_info);
+
+  strftime(time_string, sizeof(time_string), "%Y-%m-%d %H:%M:%S", &time_info);
+  write_to_data_file(time_string);
 }
 
 static void send_and_receive(struct connection_data *data) {
@@ -242,6 +273,7 @@ int main(int argc, char *argv[]) {
   }
 
   register_signal_handler();
+  start_timer();
 
   struct slisthead head;
   SLIST_INIT(&head);
@@ -250,6 +282,11 @@ int main(int argc, char *argv[]) {
     int clientfd;
     struct sockaddr_storage client_addr;
     socklen_t addr_size = sizeof(client_addr);
+
+    if (caught_alarm) {
+      write_time_to_data();
+      caught_alarm = false;
+    }
 
     clientfd = accept(sockfd, (struct sockaddr *)&client_addr, &addr_size);
     if (clientfd == -1) {
