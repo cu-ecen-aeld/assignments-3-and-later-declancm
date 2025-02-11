@@ -4,7 +4,7 @@ CFLAGS ?= -g -Wall -Werror
 all: default
 
 default:
-	$(CC) $(CFLAGS) aesdsocket.c -o aesdsocket
+	$(CC) $(CFLAGS) $(LDFLAGS) aesdsocket.c -o aesdsocket
 
 clean:
 	rm -f aesdsocket
