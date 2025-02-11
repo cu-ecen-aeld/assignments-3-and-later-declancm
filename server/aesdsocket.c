@@ -52,7 +52,6 @@ static void register_signal_handler() {
   memset(&new_action, 0, sizeof(new_action));
   new_action.sa_handler = signal_handler;
 
-
   if (sigaction(SIGALRM, &new_action, NULL) == -1) {
     perror("sigaction");
   }
@@ -145,7 +144,8 @@ static void write_time_to_data() {
   time(&time_raw);
   localtime_r(&time_raw, &time_info);
 
-  strftime(time_string, sizeof(time_string), "%Y-%m-%d %H:%M:%S", &time_info);
+  strftime(time_string, sizeof(time_string), "timestamp:%a, %d %b %Y %T %z",
+           &time_info);
   write_to_data_file(time_string);
 }
 
