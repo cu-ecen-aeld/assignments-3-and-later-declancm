@@ -29,7 +29,11 @@ struct connection_data {
 SLIST_HEAD(slisthead, connection_data);
 
 const char port[] = "9000";
+#if USE_AESD_CHAR_DEVICE
+const char data_file_name[] = "/dev/aesdchar";
+#else
 const char data_file_name[] = "/var/tmp/aesdsocketdata";
+#endif
 
 bool caught_alarm = false;
 bool caught_sigint = false;
@@ -273,7 +277,10 @@ int main(int argc, char *argv[]) {
   }
 
   register_signal_handler();
+  
+#if !USE_AESD_CHAR_DEVICE
   start_timer();
+#endif
 
   struct slisthead head;
   SLIST_INIT(&head);
@@ -350,11 +357,13 @@ int main(int argc, char *argv[]) {
 
   close(sockfd);
 
+#if !USE_AESD_CHAR_DEVICE
   status = unlink(data_file_name);
   if (status == -1) {
     perror("unlink");
     return -1;
   }
+#endif
 
   return 0;
 }
