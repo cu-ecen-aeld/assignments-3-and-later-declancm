@@ -11,6 +11,7 @@
  *
  */
 
+#include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/printk.h>
@@ -32,6 +33,13 @@ int aesd_open(struct inode *inode, struct file *filp)
     /**
      * TODO: handle open
      */
+
+    // Set filp->private_data with our aesd_dev device struct
+
+    struct aesd_dev *dev;
+	dev = container_of(inode->i_cdev, struct aesd_dev, cdev);
+	filp->private_data = dev;
+
     return 0;
 }
 
@@ -52,6 +60,30 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     /**
      * TODO: handle read
      */
+
+    struct aesd_dev *dev = filp->private_data;
+
+    char *kbuf = kmalloc(count, GFP_KERNEL);
+    if (kbuf == NULL) {
+        return -ENOMEM;
+    }
+
+    size_t entry_offset_byte;
+    struct aesd_buffer_entry *entry = aesd_circular_buffer_find_entry_offset_for_fpos(&dev->buffer, *f_pos, &entry_offset_byte);
+
+    if (entry != NULL) {
+        size_t bytes_to_copy = min(count, entry->size - entry_offset_byte);
+
+        if (copy_to_user(buf, entry->buffptr + entry_offset_byte, bytes_to_copy)) {
+            retval = -EFAULT;
+        } else {
+            retval = bytes_to_copy;
+            *f_pos += bytes_to_copy;
+        }
+    }
+
+    kfree(kbuf);
+
     return retval;
 }
 
@@ -63,6 +95,33 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     /**
      * TODO: handle write
      */
+
+    struct aesd_dev *dev = filp->private_data;
+
+    char *kbuf = kmalloc(count, GFP_KERNEL);
+    if (kbuf == NULL) {
+        return -ENOMEM;
+    }
+
+    if (copy_from_user(kbuf, buf, count)) {
+        kfree(kbuf);
+        return -EFAULT;
+    }
+
+    dev->working_entry.buffptr = kbuf;
+    dev->working_entry.size = count;
+
+    const char *overwritten_buffptr = aesd_circular_buffer_add_entry(&dev->buffer, &dev->working_entry);
+    if (overwritten_buffptr != NULL) {
+        kfree(overwritten_buffptr);
+    }
+
+    dev->working_entry.buffptr = NULL;
+    dev->working_entry.size = 0;
+
+    *f_pos += count;
+    retval = count;
+    
     return retval;
 }
 struct file_operations aesd_fops = {
@@ -106,6 +165,8 @@ int aesd_init_module(void)
      * TODO: initialize the AESD specific portion of the device
      */
 
+    // initialize aesd_dev structure including locking primative
+
     result = aesd_setup_cdev(&aesd_device);
 
     if( result ) {
@@ -124,6 +185,8 @@ void aesd_cleanup_module(void)
     /**
      * TODO: cleanup AESD specific poritions here as necessary
      */
+
+    // cleanup anything allocated in aesd_init_module
 
     unregister_chrdev_region(devno, 1);
 }
