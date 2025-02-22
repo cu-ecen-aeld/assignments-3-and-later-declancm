@@ -13,6 +13,7 @@
 
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/init.h>
 #include <linux/printk.h>
 #include <linux/types.h>
@@ -68,6 +69,8 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
         return -ENOMEM;
     }
 
+    mutex_lock(&dev->lock);
+
     size_t entry_offset_byte;
     struct aesd_buffer_entry *entry = aesd_circular_buffer_find_entry_offset_for_fpos(&dev->buffer, *f_pos, &entry_offset_byte);
 
@@ -81,6 +84,8 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
             *f_pos += bytes_to_copy;
         }
     }
+
+    mutex_unlock(&dev->lock);
 
     kfree(kbuf);
 
@@ -108,19 +113,49 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         return -EFAULT;
     }
 
-    dev->working_entry.buffptr = kbuf;
-    dev->working_entry.size = count;
+    // assemble the working entry and add it once a newline is found
+    
+    mutex_lock(&dev->lock);
 
-    const char *overwritten_buffptr = aesd_circular_buffer_add_entry(&dev->buffer, &dev->working_entry);
-    if (overwritten_buffptr != NULL) {
-        kfree(overwritten_buffptr);
+    size_t kbuf_offset = 0;
+
+    while (kbuf_offset < count) {
+        char *newline = memchr(kbuf + kbuf_offset, '\n', count - kbuf_offset);
+        bool newline_found = newline != NULL;
+        size_t size = newline_found ? newline - (kbuf + kbuf_offset) + 1 : count - kbuf_offset;
+
+        char *entry_buffptr = kmalloc(dev->working_entry.size + size, GFP_KERNEL);
+        if (entry_buffptr == NULL) {
+            retval = -ENOMEM;
+            goto cleanup;
+        }
+
+        memcpy(entry_buffptr, dev->working_entry.buffptr, dev->working_entry.size);
+        memcpy(entry_buffptr + dev->working_entry.size, kbuf + kbuf_offset, size);
+        if (dev->working_entry.buffptr != NULL) {
+            kfree(dev->working_entry.buffptr);
+        }
+        dev->working_entry.buffptr = entry_buffptr;
+        dev->working_entry.size += size;
+
+        if (newline_found) {
+            const char *overwritten_buffptr = aesd_circular_buffer_add_entry(&dev->buffer, &dev->working_entry);
+            if (overwritten_buffptr != NULL) {
+                kfree(overwritten_buffptr);
+            }
+
+            dev->working_entry.buffptr = NULL;
+            dev->working_entry.size = 0;
+        }
+
+        kbuf_offset += size;
     }
 
-    dev->working_entry.buffptr = NULL;
-    dev->working_entry.size = 0;
-
-    *f_pos += count;
     retval = count;
+
+cleanup:
+    mutex_unlock(&dev->lock);
+    kfree(kbuf);
     
     return retval;
 }
@@ -166,6 +201,11 @@ int aesd_init_module(void)
      */
 
     // initialize aesd_dev structure including locking primative
+
+    aesd_circular_buffer_init(&aesd_device.buffer);
+    aesd_device.working_entry.buffptr = NULL;
+    aesd_device.working_entry.size = 0;
+    mutex_init(&aesd_device.lock);
 
     result = aesd_setup_cdev(&aesd_device);
 
