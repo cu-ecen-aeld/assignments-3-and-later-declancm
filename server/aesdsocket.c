@@ -115,14 +115,22 @@ static void write_to_data_file(const char *line) {
 static void send_data_file(int sockfd) {
   pthread_mutex_lock(&data_file_mutex);
 
-  int fd = open(data_file_name, O_RDONLY);
+  FILE *data_file = fopen(data_file_name, "rb");
 
-  if (fd < 0) {
+  if (data_file == NULL) {
     perror("fopen");
   } else {
-    struct stat file_stat;
-    fstat(fd, &file_stat);
-    sendfile(sockfd, fd, NULL, file_stat.st_size);
+    char buffer[1024];
+    size_t bytes_read;
+    
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), data_file)) > 0) {
+      if (send(sockfd, buffer, bytes_read, 0) < 0) {
+        perror("Failed to send file");
+        break;
+      }
+    }
+
+    fclose(data_file);
   }
 
   pthread_mutex_unlock(&data_file_mutex);
