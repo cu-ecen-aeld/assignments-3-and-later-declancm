@@ -64,11 +64,6 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
 
     struct aesd_dev *dev = filp->private_data;
 
-    char *kbuf = kmalloc(count, GFP_KERNEL);
-    if (kbuf == NULL) {
-        return -ENOMEM;
-    }
-
     mutex_lock(&dev->lock);
 
     size_t entry_offset_byte;
@@ -86,8 +81,6 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     }
 
     mutex_unlock(&dev->lock);
-
-    kfree(kbuf);
 
     return retval;
 }
