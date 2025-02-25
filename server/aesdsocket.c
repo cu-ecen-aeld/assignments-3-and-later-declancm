@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/queue.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
@@ -17,6 +18,14 @@
 #include <sys/types.h>
 #include <syslog.h>
 #include <unistd.h>
+
+struct aesd_seekto {
+    uint32_t write_cmd;
+    uint32_t write_cmd_offset;
+};
+
+#define AESD_IOC_MAGIC 0x16
+#define AESDCHAR_IOCSEEKTO _IOWR(AESD_IOC_MAGIC, 1, struct aesd_seekto)
 
 struct connection_data {
   pthread_t pid;
@@ -107,6 +116,28 @@ static void write_to_data_file(const char *line) {
   } else {
     fprintf(data_file, "%s\n", line);
     fclose(data_file);
+  }
+
+  pthread_mutex_unlock(&data_file_mutex);
+}
+
+static void send_seek(unsigned int write_cmd, unsigned int write_cmd_offset) {
+  pthread_mutex_lock(&data_file_mutex);
+
+  int fd = open(data_file_name, O_RDWR);
+
+  if (fd == -1) {
+    perror("fopen");
+  } else {
+    struct aesd_seekto seekto = {
+      .write_cmd = write_cmd,
+      .write_cmd_offset = write_cmd_offset,
+    };
+
+    if (ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) == -1) {
+      perror("ioctl");
+    }
+    close(fd);
   }
 
   pthread_mutex_unlock(&data_file_mutex);
@@ -214,8 +245,14 @@ static void send_and_receive(struct connection_data *data) {
 
       if (newline_found) {
         accum[accum_used] = '\0';
+        unsigned int write_cmd;
+        unsigned int write_cmd_offset;
 
-        write_to_data_file(accum);
+        if (sscanf(accum, "AESDCHAR_IOCSEEKTO:%u,%u", &write_cmd, &write_cmd_offset) == 2) {
+          send_seek(write_cmd, write_cmd_offset);
+        } else {
+          write_to_data_file(accum);
+        }
         send_data_file(data->sockfd);
 
         // Reset the accumulator
