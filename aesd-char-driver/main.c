@@ -152,12 +152,58 @@ cleanup:
     
     return retval;
 }
+
+loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
+{
+    loff_t newpos;
+    size_t size = 0;
+    struct aesd_dev *dev = filp->private_data;
+    PDEBUG("llseek");
+
+    mutex_lock(&dev->lock);
+    
+    for (int i = 0; i < AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; i++) {
+        int idx = (dev->buffer.out_offs + i) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+        if (i >= (dev->buffer.in_offs - dev->buffer.out_offs + 
+                 (dev->buffer.in_offs <= dev->buffer.out_offs ? 
+                  AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED : 0)))
+            break;
+        size += dev->buffer.entry[idx].size;
+    }
+
+    switch (whence) {
+        case SEEK_SET:
+            newpos = off;
+            break;
+        case SEEK_CUR:
+            newpos = filp->f_pos + off;
+            break;
+        case SEEK_END:
+            newpos = size + off;
+            break;
+        default:
+            mutex_unlock(&dev->lock);
+            return -EINVAL;
+    }
+
+    if (newpos < 0 || newpos > size) {
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+
+    filp->f_pos = newpos;
+    mutex_unlock(&dev->lock);
+
+    return newpos;
+}
+
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
     .read =     aesd_read,
     .write =    aesd_write,
     .open =     aesd_open,
     .release =  aesd_release,
+    .llseek =   aesd_llseek,
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
