@@ -106,62 +106,40 @@ static void start_daemon() {
   close(STDERR_FILENO);
 }
 
-static void write_to_data_file(const char *line) {
+static void write_to_data_file(FILE *file, const char *line) {
   pthread_mutex_lock(&data_file_mutex);
 
-  FILE *data_file = fopen(data_file_name, "a");
+  fprintf(file, "%s\n", line);
 
-  if (data_file == NULL) {
-    perror("fopen");
-  } else {
-    fprintf(data_file, "%s\n", line);
-    fclose(data_file);
+  pthread_mutex_unlock(&data_file_mutex);
+}
+
+static void send_seek(FILE *file, unsigned int write_cmd, unsigned int write_cmd_offset) {
+  pthread_mutex_lock(&data_file_mutex);
+
+  struct aesd_seekto seekto = {
+    .write_cmd = write_cmd,
+    .write_cmd_offset = write_cmd_offset,
+  };
+
+  if (ioctl(fileno(file), AESDCHAR_IOCSEEKTO, &seekto) == -1) {
+    perror("ioctl");
   }
 
   pthread_mutex_unlock(&data_file_mutex);
 }
 
-static void send_seek(unsigned int write_cmd, unsigned int write_cmd_offset) {
+static void send_data_file(FILE *file, int sockfd) {
   pthread_mutex_lock(&data_file_mutex);
 
-  int fd = open(data_file_name, O_RDWR);
-
-  if (fd == -1) {
-    perror("fopen");
-  } else {
-    struct aesd_seekto seekto = {
-      .write_cmd = write_cmd,
-      .write_cmd_offset = write_cmd_offset,
-    };
-
-    if (ioctl(fd, AESDCHAR_IOCSEEKTO, &seekto) == -1) {
-      perror("ioctl");
+  char buffer[1024];
+  size_t bytes_read;
+  
+  while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+    if (send(sockfd, buffer, bytes_read, 0) < 0) {
+      perror("Failed to send file");
+      break;
     }
-    close(fd);
-  }
-
-  pthread_mutex_unlock(&data_file_mutex);
-}
-
-static void send_data_file(int sockfd) {
-  pthread_mutex_lock(&data_file_mutex);
-
-  FILE *data_file = fopen(data_file_name, "rb");
-
-  if (data_file == NULL) {
-    perror("fopen");
-  } else {
-    char buffer[1024];
-    size_t bytes_read;
-    
-    while ((bytes_read = fread(buffer, 1, sizeof(buffer), data_file)) > 0) {
-      if (send(sockfd, buffer, bytes_read, 0) < 0) {
-        perror("Failed to send file");
-        break;
-      }
-    }
-
-    fclose(data_file);
   }
 
   pthread_mutex_unlock(&data_file_mutex);
@@ -189,7 +167,10 @@ static void write_time_to_data() {
 
   strftime(time_string, sizeof(time_string), "timestamp:%a, %d %b %Y %T %z",
            &time_info);
-  write_to_data_file(time_string);
+
+  FILE *file = fopen(data_file_name, "a");
+  write_to_data_file(file, time_string);
+  fclose(file);
 }
 
 static void send_and_receive(struct connection_data *data) {
@@ -201,6 +182,11 @@ static void send_and_receive(struct connection_data *data) {
   size_t accum_used = 0;
 
   syslog(LOG_INFO, "Accepted connection from %s", data->ip_address);
+
+  FILE *data_file = fopen(data_file_name, "wb+");
+  if (data_file == NULL) {
+    perror("fopen");
+  }
 
   while (1) {
     bytes_read = recv(data->sockfd, buffer, sizeof(buffer), 0);
@@ -249,11 +235,12 @@ static void send_and_receive(struct connection_data *data) {
         unsigned int write_cmd_offset;
 
         if (sscanf(accum, "AESDCHAR_IOCSEEKTO:%u,%u", &write_cmd, &write_cmd_offset) == 2) {
-          send_seek(write_cmd, write_cmd_offset);
+          printf("Received seek command: %u, %u\n", write_cmd, write_cmd_offset);
+          send_seek(data_file, write_cmd, write_cmd_offset);
         } else {
-          write_to_data_file(accum);
+          write_to_data_file(data_file, accum);
         }
-        send_data_file(data->sockfd);
+        send_data_file(data_file, data->sockfd);
 
         // Reset the accumulator
         line_start = line_end + 1;
@@ -264,6 +251,7 @@ static void send_and_receive(struct connection_data *data) {
 
   free(accum);
   close(data->sockfd);
+  fclose(data_file);
 
   syslog(LOG_INFO, "Closed connection from %s", data->ip_address);
 
